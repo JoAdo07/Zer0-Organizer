@@ -23,10 +23,15 @@ Usage examples
 
   Only include specific extensions:
     python organizing_files.py rename --dir . --ext .jpg .png --prefix OLD_ --commit
+
+  Every --commit run writes a journal (default ~/.zer0-organizer/). Undo it:
+    python organizing_files.py undo
+    python organizing_files.py undo --journal ~/.zer0-organizer/journal-....json --commit
 """
 
 import argparse
 import datetime
+import json
 import os
 import sys
 import fnmatch
@@ -76,7 +81,8 @@ def unique_name(dirpath: str, base: str, ext: str) -> str:
         n += 1
     return candidate
 
-def safe_move(src: str, dst_dir: str, new_name: Optional[str], dry_run: bool) -> Tuple[str, str]:
+def safe_move(src: str, dst_dir: str, new_name: Optional[str], dry_run: bool,
+              journal: Optional[List[Dict[str, str]]] = None) -> Tuple[str, str]:
     os.makedirs(dst_dir, exist_ok=True)
     if new_name is None:
         new_name = os.path.basename(src)
@@ -93,9 +99,34 @@ def safe_move(src: str, dst_dir: str, new_name: Optional[str], dry_run: bool) ->
         else:
             os.replace(src, final_path)
             print(f"[DONE] {action}")
+            if journal is not None and os.path.abspath(src) != os.path.abspath(final_path):
+                journal.append({"src": os.path.abspath(src), "dst": os.path.abspath(final_path)})
     except Exception as e:
         print(f"[ERROR] Failed to move {src} to {final_path}: {e}")
     return src, final_path
+
+def default_journal_dir() -> str:
+    return os.path.join(os.path.expanduser("~"), ".zer0-organizer")
+
+def new_journal_path() -> str:
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return os.path.join(default_journal_dir(), f"journal-{stamp}.json")
+
+def save_journal(journal: List[Dict[str, str]], path: str) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(journal, f, indent=2)
+    print(f"Journal saved to {path} ({len(journal)} move(s)). Undo with: python organizing_files.py undo --journal \"{path}\"")
+
+def latest_journal() -> Optional[str]:
+    d = default_journal_dir()
+    if not os.path.isdir(d):
+        return None
+    journals = sorted(
+        (os.path.join(d, n) for n in os.listdir(d) if n.startswith("journal-") and n.endswith(".json")),
+        key=os.path.getmtime,
+    )
+    return journals[-1] if journals else None
 
 def file_datestamp(path: str, datefmt: str) -> str:
     ts = os.path.getmtime(path)  # last modified time
@@ -114,6 +145,7 @@ def cmd_rename(args: argparse.Namespace) -> None:
     if args.seq and width is None:
         width = max(2, len(str(len(files))))
 
+    journal: List[Dict[str, str]] = []
     count = 0
     for idx, path in enumerate(sorted(files), start=args.start):
         dirpath = os.path.dirname(path)
@@ -137,10 +169,12 @@ def cmd_rename(args: argparse.Namespace) -> None:
             # Skip if no change
             continue
 
-        safe_move(path, dirpath, new_name, dry_run=(not args.commit))
+        safe_move(path, dirpath, new_name, dry_run=(not args.commit), journal=journal)
         count += 1
 
     print(f"{'(Preview) ' if not args.commit else ''}Renamed {count} file(s).")
+    if args.commit and journal:
+        save_journal(journal, args.journal or new_journal_path())
 
 def category_for_ext(ext: str) -> str:
     ext = ext.lower()
@@ -156,6 +190,7 @@ def cmd_sort(args: argparse.Namespace) -> None:
         return
 
     moved = 0
+    journal: List[Dict[str, str]] = []
     for path in files:
         dirpath = os.path.abspath(args.dir)
         _, name = os.path.split(path)
@@ -167,10 +202,54 @@ def cmd_sort(args: argparse.Namespace) -> None:
             sub = category_for_ext(ext)
 
         dst_dir = os.path.join(dirpath, sub)
-        safe_move(path, dst_dir, name, dry_run=(not args.commit))
+        safe_move(path, dst_dir, name, dry_run=(not args.commit), journal=journal)
         moved += 1
 
     print(f"{'(Preview) ' if not args.commit else ''}Moved {moved} file(s).")
+    if args.commit and journal:
+        save_journal(journal, args.journal or new_journal_path())
+
+def cmd_undo(args: argparse.Namespace) -> None:
+    path = args.journal or latest_journal()
+    if not path or not os.path.isfile(path):
+        print("No journal found. Pass --journal PATH to a journal saved by a --commit run.")
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        entries = json.load(f)
+    if not isinstance(entries, list) or not entries:
+        print(f"Journal {path} is empty, nothing to undo.")
+        return
+
+    dry_run = not args.commit
+    restored = skipped = 0
+    for entry in reversed(entries):
+        current, original = entry.get("dst", ""), entry.get("src", "")
+        if not current or not original:
+            print(f"[SKIP] Malformed journal entry: {entry}")
+            skipped += 1
+            continue
+        if not os.path.exists(current):
+            print(f"[SKIP] Already gone (nothing to move back): {current}")
+            skipped += 1
+            continue
+        if os.path.exists(original):
+            print(f"[SKIP] Original location occupied, leaving in place: {current}")
+            skipped += 1
+            continue
+        action = f"{current} -> {original}"
+        try:
+            if dry_run:
+                print(f"[DRY RUN] {action}")
+            else:
+                os.makedirs(os.path.dirname(original) or ".", exist_ok=True)
+                os.replace(current, original)
+                print(f"[DONE] {action}")
+            restored += 1
+        except Exception as e:
+            print(f"[ERROR] Failed to move {current} back: {e}")
+            skipped += 1
+
+    print(f"{'(Preview) ' if dry_run else ''}Restored {restored} file(s), skipped {skipped}.")
 
 # ---------- CLI ----------
 
@@ -195,12 +274,20 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--seq", action="store_true", help="Add sequential numbering.")
     pr.add_argument("--start", type=int, default=1, help="Starting number (default: 1).")
     pr.add_argument("--width", type=int, default=None, help="Zero-pad width (auto if omitted).")
+    pr.add_argument("--journal", default=None, help="Journal file to record applied moves (default: ~/.zer0-organizer/journal-<timestamp>.json).")
     pr.set_defaults(func=cmd_rename)
 
     # sort
     ps = sub.add_parser("sort", parents=[common], help="Move files into folders by extension or category.")
     ps.add_argument("--by", choices=["ext", "category"], default="category", help="Group by extension or category.")
+    ps.add_argument("--journal", default=None, help="Journal file to record applied moves (default: ~/.zer0-organizer/journal-<timestamp>.json).")
     ps.set_defaults(func=cmd_sort)
+
+    # undo
+    pu = sub.add_parser("undo", help="Reverse a previous --commit run from its journal (dry run unless --commit).")
+    pu.add_argument("--journal", default=None, help="Journal file to undo (default: latest in ~/.zer0-organizer).")
+    pu.add_argument("--commit", action="store_true", help="Apply changes. Without this, it's a dry run.")
+    pu.set_defaults(func=cmd_undo)
 
     return p
 
